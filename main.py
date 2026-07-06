@@ -49,11 +49,11 @@ REMOVE_TAGS = ["script", "style", "nav", "footer", "header", "aside", "noscript"
 
 @dataclass
 class PluginConfig:
-    """插件配置。默认用 DuckDuckGo，零部署。"""
+    """插件配置。默认用 Bing，零部署。"""
     search_backend: str = "bing"          # bing | duckduckgo | searxng
     searxng_url: str = "http://localhost:8080"
     proxy: str = ""                       # 代理地址，如 http://127.0.0.1:7890
-    max_results: int = 5
+    max_results: int = 6
     cache_ttl: int = 900
     cache_max_size: int = 100
     fetch_timeout: int = 15
@@ -69,7 +69,7 @@ class PluginConfig:
             search_backend=str(cfg.get("search_backend", "bing")),
             searxng_url=str(cfg.get("searxng_url", "http://localhost:8080")).rstrip("/"),
             proxy=str(cfg.get("proxy", "")).strip(),
-            max_results=_clamp(int(cfg.get("max_results", 5)), 1, 20),
+            max_results=_clamp(int(cfg.get("max_results", 6)), 1, 20),
             cache_ttl=max(int(cfg.get("cache_ttl", 900)), 0),
             cache_max_size=max(int(cfg.get("cache_max_size", 100)), 1),
             fetch_timeout=_clamp(int(cfg.get("fetch_timeout", 15)), 3, 60),
@@ -203,9 +203,8 @@ class DuckDuckGoSearcher(BaseSearcher):
 
 class BingSearcher(BaseSearcher):
     """
-    Bing 搜索后端 — 直接爬 cn.bing.com 的 HTML 搜索结果。
-    类似 Claude Code 的 BingSearchAdapter，无需 API Key，无需代理。
-    cn.bing.com 国内可直接访问。
+    Bing 搜索后端 — 直接爬 www.bing.com 的 HTML 搜索结果。
+    类似 Claude Code 的 BingSearchAdapter，无需 API Key。
     """
 
     def __init__(self, session: aiohttp.ClientSession, proxy: str = "") -> None:
@@ -219,7 +218,7 @@ class BingSearcher(BaseSearcher):
         allowed_domains: Optional[List[str]] = None,
         blocked_domains: Optional[List[str]] = None,
     ) -> List[Dict[str, str]]:
-        url = "https://cn.bing.com/search"
+        url = "https://www.bing.com/search"
         params = {"q": query, "count": max_results}
         headers = {"User-Agent": DEFAULT_USER_AGENT}
 
@@ -354,10 +353,10 @@ def create_searcher(config: PluginConfig, session: Optional[aiohttp.ClientSessio
         logger.info(f"Using SearXNG backend: {config.searxng_url}")
         return SearXNGSearcher(config.searxng_url, session)
     else:
-        # 默认 bing — 国内直连，类似 Claude Code 的 BingSearchAdapter
+        # 默认 bing — 类似 Claude Code 的 BingSearchAdapter
         if session is None:
             raise ValueError("Bing 后端需要 aiohttp.ClientSession")
-        logger.info("Using Bing backend (cn.bing.com, no proxy needed)")
+        logger.info(f"Using Bing backend (www.bing.com){' with proxy' if config.proxy else ''}")
         return BingSearcher(session, proxy=config.proxy)
 
 
@@ -464,7 +463,7 @@ def _clamp(val: int, lo: int, hi: int) -> int:
 # → LLM 像平常一样回复，自然用上搜索上下文。
 # ---------------------------------------------------------------------------
 
-@register("web_search_auto", "bentianjia", "自动网络搜索（Bing 直连零部署）", "2.0.0")
+@register("web_search_auto", "bentianjia-0721", "自动网络搜索（Bing 搜索零部署）", "2.1.0")
 class WebSearchAuto(Star):
     """
     自动网络搜索插件 — LLM 无需命令前缀，无需 function calling。
@@ -530,6 +529,8 @@ class WebSearchAuto(Star):
         """
         拦截 LLM 请求 → 用用户消息自动搜索 → 结果注入 system prompt。
         LLM 无需 function calling，直接基于上下文回复。
+
+        优化：强制触发搜索，不过滤短消息，确保 LLM 优先使用搜索结果。
         """
         await self._ensure_initialized()
         if not self._config:
@@ -537,7 +538,7 @@ class WebSearchAuto(Star):
 
         # 获取用户消息文本
         user_msg = _get_event_text(event)
-        if not user_msg or len(user_msg) < 4:
+        if not user_msg:
             return
 
         # 避免重复搜同一句
@@ -558,28 +559,40 @@ class WebSearchAuto(Star):
             return
 
         if not results:
+            logger.warning(f"auto-search returned no results for: '{user_msg[:60]}'")
             return
 
-        # 构建搜索上下文
+        # 构建搜索上下文 - 增强提示以确保 LLM 优先使用搜索结果
         ctx_lines = [
-            "## [Web Search Context — use this to answer accurately, cite sources briefly]",
+            "## [Web Search Results - PRIORITY CONTEXT]",
+            "",
+            "**IMPORTANT**: The following search results provide current, factual information.",
+            "Always prioritize these results when answering the user's question.",
+            "Cite sources naturally by mentioning the title or URL.",
+            "",
+            f"Search query: {user_msg}",
+            f"Found {len(results)} result(s):",
             "",
         ]
         for i, r in enumerate(results, 1):
             snippet = r.get("snippet", "").replace("\n", " ").strip()
-            ctx_lines.append(f"{i}. {r['title']} - {r['url']}")
+            ctx_lines.append(f"**Result {i}**: {r['title']}")
+            ctx_lines.append(f"URL: {r['url']}")
             if snippet:
-                ctx_lines.append(f"   {snippet[:200]}")
+                ctx_lines.append(f"Summary: {snippet[:300]}")
             ctx_lines.append("")
 
-        ctx_lines.append("[End of search context]")
+        ctx_lines.append("[End of search results]")
+        ctx_lines.append("")
         context_block = "\n".join(ctx_lines)
 
-        # 注入 system prompt
+        # 注入 system prompt - 放在最前面以提高优先级
         if req.system_prompt:
             req.system_prompt = context_block + "\n\n" + req.system_prompt
         else:
             req.system_prompt = context_block
+
+        logger.info(f"Injected {len(results)} search results into LLM context")
 
 
 def _get_event_text(event: AstrMessageEvent) -> str:
